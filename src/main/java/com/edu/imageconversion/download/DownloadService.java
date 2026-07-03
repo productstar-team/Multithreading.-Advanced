@@ -11,9 +11,11 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -34,7 +36,10 @@ public class DownloadService {
     // I/O-bound tasks spend most time waiting on the network, not on CPU.
     // corePoolSize = cores * 2: keeps enough threads active to saturate bandwidth
     //   without the overhead of creating them on demand.
-    // maxPoolSize = 20: hard cap on concurrent connections; beyond this the queue absorbs bursts.
+    // maxPoolSize = max(corePoolSize, cores * 4): scales with the machine so maxPoolSize
+    //   is always ≥ corePoolSize (ThreadPoolExecutor requires this invariant); on machines
+    //   with many cores (e.g. Apple Silicon M3 Pro, 12+ cores) a hardcoded 20 would be
+    //   smaller than corePoolSize and cause IllegalArgumentException at startup.
     // LinkedBlockingQueue(50): bounded — prevents OOM if callers submit faster than downloads complete.
     // CallerRunsPolicy: backpressure instead of silent rejection; the HTTP thread blocks,
     //   slowing ingest rather than losing work.
@@ -44,9 +49,11 @@ public class DownloadService {
 
     public DownloadService() {
         int cores = Runtime.getRuntime().availableProcessors();
+        int corePoolSize = cores * 2;
+        int maxPoolSize = Math.max(corePoolSize, cores * 4);
         this.executor = new ThreadPoolExecutor(
-                cores * 2,
-                20,
+                corePoolSize,
+                maxPoolSize,
                 60L, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(50),
                 new ThreadPoolExecutor.CallerRunsPolicy()
@@ -95,15 +102,24 @@ public class DownloadService {
         String thread = Thread.currentThread().getName();
         logger.info("[{}] Starting download: {}", thread, url);
 
+        // Bug 3 fix: declared before try so the catch block can delete a partially
+        // written (or empty placeholder) file if the download fails mid-transfer.
+        Path filePath = null;
         try {
             URI uri = URI.create(url);
             String filename = sanitizeFilename(uri);
-            Path filePath = uniquePath(targetPath, filename);
 
-            // Prevent path traversal: normalized path must stay inside targetPath.
-            if (!filePath.startsWith(targetPath)) {
+            // Path traversal check on the base filename BEFORE any file is created on disk.
+            // uniquePath() only appends _N suffixes in the same directory, so checking
+            // the unsuffixed candidate is sufficient.
+            Path baseCandidate = targetPath.resolve(filename).normalize();
+            if (!baseCandidate.startsWith(targetPath)) {
                 throw new SecurityException("Derived filename escapes target directory: " + filename);
             }
+
+            // Bug 2 fix: uniquePath() now atomically reserves the file via Files.createFile().
+            // The returned path points to an empty placeholder; we overwrite it below.
+            filePath = uniquePath(targetPath, filename);
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(uri)
@@ -111,7 +127,13 @@ public class DownloadService {
                     .GET()
                     .build();
 
-            HttpResponse<Path> response = httpClient.send(request, HttpResponse.BodyHandlers.ofFile(filePath));
+            // TRUNCATE_EXISTING: uniquePath already created an empty placeholder;
+            // without this flag the body would be appended, not overwritten.
+            HttpResponse<Path> response = httpClient.send(
+                    request,
+                    HttpResponse.BodyHandlers.ofFile(
+                            filePath, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)
+            );
             long durationMs = System.currentTimeMillis() - start;
 
             if (response.statusCode() >= 200 && response.statusCode() < 300) {
@@ -127,6 +149,14 @@ public class DownloadService {
         } catch (Exception e) {
             long durationMs = System.currentTimeMillis() - start;
             logger.error("[{}] Error downloading {} after {}ms: {}", thread, url, durationMs, e.getMessage());
+            // Bug 3 fix: delete the empty placeholder or partial file left on disk.
+            if (filePath != null) {
+                try {
+                    Files.deleteIfExists(filePath);
+                } catch (IOException ioe) {
+                    logger.warn("[{}] Could not delete partial file {}: {}", thread, filePath, ioe.getMessage());
+                }
+            }
             return DownloadResult.failed(url, e.getMessage(), durationMs);
         }
     }
@@ -151,12 +181,13 @@ public class DownloadService {
         return name;
     }
 
-    // Appends _1, _2, … suffix when a file with this name already exists.
-    private Path uniquePath(Path dir, String filename) {
-        Path candidate = dir.resolve(filename);
-        if (!Files.exists(candidate)) {
-            return candidate;
-        }
+    // Atomically reserves a unique filename by creating an empty placeholder file.
+    // Files.createFile() is an atomic check-and-create at the OS level, eliminating
+    // the TOCTOU window that Files.exists() + write has: two threads picking the same
+    // candidate simultaneously will both call createFile(), but only one succeeds —
+    // the other gets FileAlreadyExistsException and retries with the next suffix.
+    // Callers must write to the returned path with TRUNCATE_EXISTING.
+    private Path uniquePath(Path dir, String filename) throws IOException {
         String base = filename;
         String ext = "";
         int dot = filename.lastIndexOf('.');
@@ -164,11 +195,17 @@ public class DownloadService {
             base = filename.substring(0, dot);
             ext = filename.substring(dot);
         }
-        int counter = 1;
-        do {
-            candidate = dir.resolve(base + "_" + counter++ + ext);
-        } while (Files.exists(candidate));
-        return candidate;
+
+        Path candidate = dir.resolve(filename);
+        int counter = 0;
+        while (true) {
+            try {
+                Files.createFile(candidate);
+                return candidate;
+            } catch (FileAlreadyExistsException e) {
+                candidate = dir.resolve(base + "_" + (++counter) + ext);
+            }
+        }
     }
 
     private String rootMessage(Throwable t) {
