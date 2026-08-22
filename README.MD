@@ -6,13 +6,20 @@
 
 Проект представляет собой API для конвертации изображений в различные форматы. Он поддерживает однопоточную и многопоточную обработку изображений с использованием Spring Boot и других библиотек. API принимает изображения в виде файлов, обрабатывает их и возвращает в формате `zip`.
 
+Помимо конвертации изображений, проект также содержит второй, независимый
+пример многопоточности — агрегатор новостей, который по одному запросу
+параллельно опрашивает несколько внешних новостных API и объединяет
+результаты в один ответ (см. раздел "Агрегатор новостей" ниже).
+
 ## Структура проекта
 
 Проект содержит несколько пакетов и классов, каждый из которых выполняет свою уникальную роль в системе:
 
 - `com.edu.imageconversion.config`: Конфигурационные классы.
 - `com.edu.imageconversion.controllers`: Контроллеры для обработки REST-запросов.
-- `com.edu.imageconversion.services`: Сервисы для обработки изображений и других вспомогательных задач.
+- `com.edu.imageconversion.services`: Сервисы для обработки изображений, агрегации новостей и других вспомогательных задач.
+- `com.edu.imageconversion.news`: Контракт клиента источника новостей и его реализации для конкретных новостных API.
+- `com.edu.imageconversion.dto`: DTO для ответа агрегатора новостей.
 
 ## Навигация по проекту
 
@@ -29,6 +36,10 @@
 ### Сервисы
 
 - **[README для классов ImageProcessingService, SvgOptimizationService и ZipService](src/main/java/com/edu/imageconversion/services/README.MD)**
+
+### Агрегатор новостей
+
+- **[README для NewsController, NewsService и NewsSourceClient](src/main/java/com/edu/imageconversion/news/README.MD)**
 
 ## Зависимости и технологии
 
@@ -78,6 +89,19 @@
     - `quality` (опционально): значение качества (по умолчанию 0.8)
 
 Примеры использования данных API и их параметры можно также найти в разделе [README для класса ImageProcessingController](src/main/java/com/edu/imageconversion/controllers/README.MD).
+
+#### Агрегация новостей
+
+- URL: `/api/news/aggregate`
+- Метод: `GET`
+- Параметры:
+    - `query`: поисковый запрос/ключевые слова
+    - `limit` (опционально): максимум новостей на источник
+
+Сервис параллельно (через `ThreadPoolExecutor` и `ExecutorService.invokeAll`) опрашивает
+5 внешних новостных API (NewsAPI.org, GNews, Currents API, The Guardian, The New York Times)
+и возвращает объединённый список новостей вместе со статусом выполнения по каждому источнику.
+Подробности — в разделе [README для NewsController, NewsService и NewsSourceClient](src/main/java/com/edu/imageconversion/news/README.MD).
 
 ## Вкладчики
 
